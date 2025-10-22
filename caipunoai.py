@@ -23,8 +23,6 @@ from datetime import datetime
 import pandas as pd
 from typing import List, Optional
 import re
-import hashlib  # 新增用于生成哈希值
-import jieba
 
 # 新增 PIL 库导入，用于本地生成图片
 from PIL import Image, ImageDraw, ImageFont
@@ -35,19 +33,19 @@ MCP_API_URL = "http://localhost:18060/api/v1/publish"
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 
 QWEN_TEXT_MODEL = "qwen-plus"
-QWEN_IMAGE_MODEL = "qwen-image-plus"  # 尽管不再使用，但保留
+QWEN_IMAGE_MODEL = "qwen-image-plus" # 尽管不再使用，但保留
 MAX_RETRIES = 3
 SLEEP_RANGE = (2, 5)
 TAGS_COUNT = 3
 MAX_TITLE_LENGTH = 20  # 中文字符为单位
 
-# 本地图片配置 - 确保路径为app/images对应实际路径
-DISH_IMAGE_DIR = "/root/xiaohongshu-mcp/images"  # 合规的本地文件路径
-DISH_FONT_PATH = "/root/xiaohongshu-mcp/汇文明朝体.otf"  # 请确保此路径指向你的字体文件
+# 本地图片配置
+DISH_IMAGE_DIR = "/root/xiaohongshu-mcp/images"
+DISH_FONT_PATH = "/root/xiaohongshu-mcp/汇文明朝体.otf"  # 🚨🚨🚨 请确保此路径指向你的字体文件 🚨🚨🚨
 IMAGE_WIDTH = 1140
 IMAGE_HEIGHT = 1472
-BG_COLOR = (245, 243, 240)  # 米白色背景
-TEXT_COLOR = (24, 125, 62)  # 绿色文字
+BG_COLOR = (245, 243, 240) # 白色背景
+TEXT_COLOR = (24, 125, 62) # 黑色文字
 
 # 日志配置
 logging.basicConfig(
@@ -82,40 +80,64 @@ def sanitize_field(text: str) -> str:
     return cleaned
 
 
-def markdown_to_xiaohongshu(text: str) -> str:
-    """
-    将 Markdown 文本转换为小红书风格排版：
-    - 清理 Markdown 标记
-    - 自动分段
-    - 保持结构清晰
-    """
+def clean_markdown(text: str) -> str:
+    """清理 Markdown 符号，防止 MCP 过滤"""
     if not text:
         return ""
-
-    # 1. 移除常见的 Markdown 标记
-    text = re.sub(r'[*_~`]+', '', text)  # 删除强调符号
-    text = re.sub(r'^\s*#+\s*', '', text, flags=re.MULTILINE)  # 删除标题标记
-    text = re.sub(r'^\s*[-+*]\s+', '• ', text, flags=re.MULTILINE)  # 转换无序列表项为 • 开头
-    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)  # 删除有序列表编号（可选）
-
-    # 2. 替换多个连续换行为空行（即段落）
-    text = re.sub(r'\n{3,}', '\n\n', text)
-
-    # 3. 在句末添加换行（中文句号/感叹号/问号）
-    text = re.sub(r'([。！？])', r'\1\n', text)
-
-    # 4. 处理粗体：**text** 或 __text__ → text（保留内容）
-    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-    text = re.sub(r'__(.*?)__', r'\1', text)
-
-    # 5. 处理链接：[text](url) → text（只保留文字）
-    text = re.sub(r'$$(.*?)$$$(.*?)$$', r'\1', text)
-
-    # 6. 去除首尾空白并返回
+    text = re.sub(r'[#\*\-\>_`]+', '', text)
+    text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 
-# ---------------- Qwen 调用 ----------------
+def format_content(text: str) -> str:
+    """美化菜谱文案换行格式"""
+    if not text:
+        return ""
+    text = text.strip()
+
+    # 在句号、感叹号、问号后加两个换行
+    text = re.sub(r'([。！？])', r'\1\n\n', text)
+
+    # 在关键段落标题前增加换行
+    keywords = ["原料", "材料", "食材", "配料", "制作流程", "做法", "步骤", "提示", "总结"]
+    for kw in keywords:
+        text = re.sub(rf'({kw})[:：]', r'\n\n【\1】\n', text)
+
+    # 压缩多余的空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
+
+# 新增：用于本地图片生成时的文本换行
+def wrap_text_dish(text, font, max_width, draw):
+    """自定义文本换行函数，按宽度限制换行"""
+    lines = []
+    text_parts = text.split('\n')
+    
+    for part in text_parts:
+        if not part:
+            lines.append('')
+            continue
+
+        current_line = []
+        current_width = 0
+        for char in part:
+            char_width = draw.textlength(char, font=font)
+            if current_width + char_width <= max_width:
+                current_line.append(char)
+                current_width += char_width
+            else:
+                lines.append(''.join(current_line))
+                current_line = [char]
+                current_width = char_width
+        if current_line:
+            lines.append(''.join(current_line))
+    return lines
+
+
+# ---------------- Qwen 调用 (未修改部分) ----------------
+# ... (Qwen 请求相关函数保持不变) ...
+
 def qwen_request(prompt: str, model: str = QWEN_TEXT_MODEL, timeout: int = 60):
     """通用 Qwen 请求函数"""
     url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
@@ -174,11 +196,11 @@ def call_qwen_text(dish_name: str, features: str, ingredients: str, process: str
 【制作流程】：{process}
 
 写作要求：
-1️⃣ 一定要保留原料和制作流程，不能省略；
-2️⃣ 强调“这是饭店商用配方”；
-3️⃣ 排版要符合小红书阅读习惯，短句和表情符号排版，文风自然、体现商业价值，核心数据加粗，600字左右；
+1️⃣ 一定要保留原料和制作流程，不省略；
+2️⃣ 强调“这是饭店配方”；
+3️⃣ 文风自然、有食欲，600字左右；
 4️⃣ 禁止出现真实饭店、人物或品牌；
-5️⃣ 可自然引导收藏或留言（不要违反小红书规定）；
+5️⃣ 禁止违规引导互动（例如收藏或留言可获取资料之类）；
 请只输出成文内容。
 """
     for attempt in range(1, MAX_RETRIES + 1):
@@ -221,9 +243,12 @@ def call_qwen_tags(dish_name: str, features: str) -> List[str]:
 
 
 # ---------------- 封面图 (核心修改) ----------------
+
+# 🚨 已删除原 call_qwen_image 函数 🚨
+
 def create_dish_image(title: str, dish_name: str) -> Optional[str]:
     """
-    本地生成菜谱封面图（优化文字断句，优先按词语拆分）
+    本地生成菜谱封面图（模仿小红书封面，突出菜名文字）
     :param title: 最终标题
     :param dish_name: 原始菜名
     :return: 本地图片文件路径
@@ -231,114 +256,80 @@ def create_dish_image(title: str, dish_name: str) -> Optional[str]:
     if not os.path.exists(DISH_IMAGE_DIR):
         os.makedirs(DISH_IMAGE_DIR)
 
-    # 生成不含中文和特殊符号的文件名（哈希+时间戳）
-    title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:8]
-    timestamp = int(time.time())
-    output_filename = f"dish_{title_hash}_{timestamp}.png"
+    # 修正后的代码：先清理标题，再使用 f-string 拼接文件名
+    # 注意：这里的 'title' 已经是 final_title，用于生成文件名
+    cleaned_title = re.sub(r'[^\w\u4e00-\u9fa5]', '', title)
+    output_filename = f"{cleaned_title}_{int(time.time())}.png"
+    
     output_path = os.path.join(DISH_IMAGE_DIR, output_filename)
 
     try:
-        # 创建图片
+        # 1. 创建图片
         image = Image.new('RGB', (IMAGE_WIDTH, IMAGE_HEIGHT), BG_COLOR)
         draw = ImageDraw.Draw(image)
 
-        # ---------------- 核心优化：智能断句逻辑 ----------------
-        title_clean = title.strip()
-        if not title_clean:
-            logging.error("❌ 标题为空，无法生成图片")
-            return None
-
-        # 1. 使用jieba分词拆分词语（精确模式，尽量保留完整词）
-        words = jieba.lcut(title_clean, cut_all=False)  # 例如："红烧排骨商用配方" → ["红烧", "排骨", "商用", "配方"]
-
-        # 2. 动态组合词语，每行控制在4-6字（优先完整词语）
-        lines = []
-        current_line = []
-        current_length = 0  # 当前行总字数
-        target_min = 2  # 每行最小字数
-        target_max = 4  # 每行最大字数
-
-        for word in words:
-            word_len = len(word)
-            # 如果当前行加该词不超过最大限制，加入当前行
-            if current_length + word_len <= target_max:
-                current_line.append(word)
-                current_length += word_len
-            else:
-                # 如果当前行已有内容，先收尾当前行
-                if current_line:
-                    lines.append(''.join(current_line))
-                    # 重置当前行，加入新词语
-                    current_line = [word]
-                    current_length = word_len
-                else:
-                    # 特殊情况：单个词语超过最大限制（如7字以上），强制按最大字数拆分
-                    lines.append(word[:target_max])
-                    current_line = [word[target_max:]]
-                    current_length = len(current_line[0])
-
-        # 加入最后一行剩余内容
-        if current_line:
-            lines.append(''.join(current_line))
-
-        # 3. 处理可能的过短行（如最后一行只有1-2字，合并到上一行）
-        if len(lines) >= 2 and len(lines[-1]) <= 2:
-            lines[-2] += lines[-1]
-            lines.pop()
-
-        # ---------------- 字体与排版 ----------------
-        margin = 50  # 边距
-        max_width = IMAGE_WIDTH - 2 * margin
-        max_height = IMAGE_HEIGHT - 2 * margin
-        line_count = len(lines)
+        # 2. 标题配置
+        # 留出上下边距 100 像素
+        margin_y = 100
+        available_width = IMAGE_WIDTH - 100 # 左右边距 50
         
-        # 动态计算最佳字体大小（确保文字撑满图片）
-        font_size = 10
-        best_size = 10
+        # 3. 字体设置和大小调整
+        font_size = 120 # 初始字体大小
+        font_path = DISH_FONT_PATH
+        
+        # 尝试加载字体
         try:
-            while True:
-                test_font = ImageFont.truetype(DISH_FONT_PATH, font_size)
-                # 检查每行宽度是否合适
-                max_line_width = max([draw.textlength(line, font=test_font) for line in lines])
-                # 检查总高度是否合适（行高+行间距）
-                line_height = test_font.getbbox("国")[3]  # 用典型汉字计算行高
-                total_height = line_height * line_count + 20 * (line_count - 1)  # 20px行间距
-                
-                # 超出边界则停止增大字体
-                if max_line_width > max_width or total_height > max_height:
-                    break
-                best_size = font_size
-                font_size += 2  # 逐步增大字体
-                
-            font = ImageFont.truetype(DISH_FONT_PATH, best_size)
-            logging.info(f"📏 最佳字体大小: {best_size}px，行数: {line_count}")
-            
+            font = ImageFont.truetype(font_path, font_size)
         except IOError:
-            logging.error(f"❌ 字体文件未找到: {DISH_FONT_PATH}")
+            logging.error(f"❌ 字体文件未找到或无法加载: {font_path}")
+            print(f"❌ 字体文件未找到或无法加载: {font_path}")
             return None
 
-        # 居中绘制文字
-        line_height = font.getbbox("国")[3]
-        total_text_height = line_height * line_count + 20 * (line_count - 1)
-        start_y = (IMAGE_HEIGHT - total_text_height) // 2  # 垂直居中
+        # 4. 文本换行
+        # 绘制文本的宽度占图片宽度的 90%
+        lines = wrap_text_dish(title, font, available_width, draw)
+        
+        # 5. 调整字体大小以适应最多3行
+        max_lines = 3
+        
+        while len(lines) > max_lines and font_size > 40:
+             font_size -= 5
+             font = ImageFont.truetype(font_path, font_size)
+             lines = wrap_text_dish(title, font, available_width, draw)
+        
+        # 6. 绘制文本
+        total_text_height = sum([font.getbbox(line)[3] for line in lines])
+        line_spacing = 30
+        total_spacing_height = line_spacing * (len(lines) - 1)
+        total_height = total_text_height + total_spacing_height
 
-        for i, line in enumerate(lines):
+        # 垂直居中
+        current_y = (IMAGE_HEIGHT - total_height) // 2
+        
+        for line in lines:
             line_width = draw.textlength(line, font=font)
-            line_x = (IMAGE_WIDTH - line_width) // 2  # 水平居中
-            line_y = start_y + i * (line_height + 20)
-            draw.text((line_x, line_y), line, fill=TEXT_COLOR, font=font)
+            # 水平居中
+            line_x = (IMAGE_WIDTH - line_width) // 2
+            
+            # 绘制文字
+            draw.text((line_x, current_y), line, fill=TEXT_COLOR, font=font)
+            
+            # 更新 Y 坐标
+            line_height = font.getbbox("示")[3]
+            current_y += line_height + line_spacing
 
-        # 保存图片
+        # 7. 保存图片
         image.save(output_path, quality=95)
-        logging.info(f"✅ 封面图已保存至: {output_path}，断句结果: {lines}")
+        logging.info(f"✅ 封面图已保存至: {output_path}")
         return output_path
 
     except Exception as e:
-        logging.error(f"❌ 图片生成异常: {e}")
+        logging.error(f"❌ 本地图片生成异常: {e}")
         return None
 
+# ---------------- CSV ----------------
+# ... (CSV 相关函数保持不变) ...
 
-# ---------------- CSV 处理 ----------------
 def load_csv_data() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH, encoding="utf-8")
     if "已发布" not in df.columns:
@@ -361,26 +352,39 @@ def filter_unpublished(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["已发布"] == "未发布"].reset_index(drop=True)
 
 
-# ---------------- 发布处理 ----------------
+# ---------------- 发布 (修改了签名和内部逻辑以适应本地文件) ----------------
+
+# ---------------- 发布 (修改为提交本地路径) ----------------
+
 def publish_to_mcp(title: str, content: str, image_path: str, tags: List[str]) -> bool:
     """
-    尝试发布内容到 MCP API，提交规范的 /app/images/ 路径格式
-    """
-    # 提取文件名（从本地绝对路径中分离）
-    image_filename = os.path.basename(image_path)
-    # 构建规范的应用内路径（/app/images/文件名）
-    app_image_path = f"/app/images/{image_filename}"
+    尝试发布内容到 MCP API，直接提交本地文件绝对路径作为图片地址。
     
+    注意：此方式要求 MCP 后端服务器能够访问这个本地路径 (例如：MCP 运行在同一台服务器
+          上，并且有权限读取 /root/caipu/dish_images/ 目录)。
+    
+    :param title: 标题
+    :param content: 正文内容
+    :param image_path: 本地图片文件的绝对路径
+    :param tags: 标签列表
+    :return: 发布是否成功
+    """
+    
+    # 🚨 移除所有关于占位 URL 的代码和警告 🚨
+    # 核心修改：直接将本地文件绝对路径作为 images 数组的元素
     payload = {
         "title": title.strip(), 
         "content": content.strip(), 
-        "images": [app_image_path],  # 使用规范的路径格式
+        # 直接使用本地文件绝对路径
+        "images": [os.path.abspath(image_path)], 
         "tags": tags
     }
     
-    logging.info(f"📤 尝试使用规范路径发布: {app_image_path}")
+    # 记录日志，确认提交的是绝对路径
+    logging.info(f"📤 尝试使用本地路径发布: {os.path.abspath(image_path)}")
     
     try:
+        # 在发送请求时，由于内容字段可能包含中文，确保 payload 能够正确编码
         resp = requests.post(MCP_API_URL, json=payload, timeout=120)
         result = resp.json()
         
@@ -388,6 +392,7 @@ def publish_to_mcp(title: str, content: str, image_path: str, tags: List[str]) -
             logging.info(f"✅ 发布成功: {title}")
             return True
             
+        # 如果发布失败，打印出后端返回的错误信息
         logging.error(f"❌ 发布失败，MCP 返回信息: {result}")
         print(f"❌ 发布失败，MCP 返回信息: {result}")
         
@@ -401,10 +406,12 @@ def publish_to_mcp(title: str, content: str, image_path: str, tags: List[str]) -
     return False
 
 
-# ---------------- 主流程 ----------------
+# ---------------- 主流程 (核心修改) ----------------
+
 def main():
     if not DASHSCOPE_API_KEY:
         print("❌ 未设置 DASHSCOPE_API_KEY 环境变量")
+        # 由于还需要 Qwen 生成标题/文案/标签，所以 DASHSCOPE_API_KEY 仍是必需的
         return
 
     df = load_csv_data()
@@ -441,14 +448,15 @@ def main():
             print("❌ 文案生成失败，跳过")
             continue
 
-        # ✅ 关键更新：使用增强型 Markdown 转换函数
-        content = markdown_to_xiaohongshu(content)
+        content = clean_markdown(content)
+        content = format_content(content)
 
         print("🏷️ 生成标签...")
         tags = call_qwen_tags(final_title, features)
         tags = [f"#{t}" if not t.startswith("#") else t for t in tags]
         print(f"✅ 标签: {tags}")
 
+        # 核心修改：调用本地图片生成函数，返回的是本地路径
         print("🎨 生成封面图...")
         image_path = create_dish_image(final_title, original_title)
         if not image_path:
@@ -458,8 +466,10 @@ def main():
         print(f"\n🚀 发布调试信息：\n标题: {final_title}\n封面(本地): {image_path}\n标签: {tags}\n文案前200字:\n{content[:200]}")
 
         print("🚀 正在发布...")
+        # 传递本地图片路径给发布函数
         if publish_to_mcp(final_title, content, image_path, tags):
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 使用原标题来定位 DataFrame 中的行
             df.loc[df["菜品标题"] == original_title, "已发布"] = "已发布" 
             df.loc[df["菜品标题"] == original_title, "发布时间"] = now
             save_csv_data(df)
